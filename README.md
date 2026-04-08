@@ -40,20 +40,31 @@ CartPole 是强化学习经典的控制问题：
 
 ## 🧠 技术方案
 
-### 初选方案：PPO
+### 手写 PPO
 
-原因：
-1. 通用性强，适合作为后续其他任务的基线
-2. 稳定性和样本效率平衡好
-3. 工程实现成熟，参考资料多
-
-### 网络结构
+基于 acrobot_ppo 框架，手写实现 Actor-Critic + GAE + PPO Clipped Objective：
 
 ```
-Actor-Critic 共享骨干网络：MLP (输入4 → 128 → 64 → 输出)
-- Actor head：2个动作的 log概率
+网络结构：MLP (输入4 → 128 → 128 → 输出)
+- Actor head：2个动作的 log 概率
 - Critic head：状态价值 V(s)
+
+训练参数：
+- n_steps=2048 | batch_size=64 | epochs=10
+- lr=3e-4 | gamma=0.99 | lam=0.95 | clip=0.2
 ```
+
+### Metrics 指标
+
+训练过程中记录：
+| 指标 | 说明 |
+|------|------|
+| Episode Reward | 每 episode 累计 reward |
+| Episode Length | 持续步数（核心） |
+| Policy Loss | PPO 策略损失 |
+| Value Loss | Critic 损失 |
+| Entropy | 策略熵（探索程度） |
+| KL Divergence | 策略更新幅度 |
 
 ---
 
@@ -61,48 +72,24 @@ Actor-Critic 共享骨干网络：MLP (输入4 → 128 → 64 → 输出)
 
 ```
 cartpole_ppo\
-├── README.md            # 本文档
-├── train.py            # PPO 训练脚本
-├── eval.py             # 评估脚本
-├── ppo_impl.py         # PPO 核心实现
-├── eval_framework.py   # 评估框架（从 acrobot_ppo 复用）
-├── video.py            # 视频录制脚本
+├── train.py            # 统一训练脚本（PPO + Metrics + 视频）
 ├── requirements.txt    # 依赖
-└── logs/               # 训练日志
+└── README.md
 ```
-
----
-
-## 📊 评估指标
-
-| 指标 | 说明 |
-|------|------|
-| Episode Length | 每 episode 的持续步数（核心） |
-| Training Loss | PPO 损失变化 |
-| Policy Entropy | 探索程度 |
-| KL Divergence | 策略更新幅度 |
-| Value Loss | Critic 损失 |
-
----
-
-## 🎬 视频采样
-
-训练完成后录制 1 个成功案例视频，验证学习效果。
 
 ---
 
 ## 🚀 运行方式
 
 ```bash
-# 训练
-python train.py --steps 500000
-
-# 评估
-python eval.py --checkpoint ppo_final.pt --episodes 50
-
-# 录制视频
-python video.py --checkpoint ppo_final.pt
+pip install -r requirements.txt
+python train.py --steps 100000
 ```
+
+训练完成后自动生成：
+- `metrics_YYYYMMDD_HHMMSS.png` — 训练曲线
+- `ppo_cartpole_YYYYMMDD_HHMMSS.pt` — 模型权重
+- `video_success_YYYYMMDD_HHMSS.mp4` — 成功案例视频
 
 ---
 
@@ -115,11 +102,10 @@ python video.py --checkpoint ppo_final.pt
 
 ## ✅ 任务清单
 
-- [ ] 项目结构搭建
-- [ ] PPO 实现
-- [ ] 训练脚本
-- [ ] 评估脚本
-- [ ] 视频录制
+- [x] 手写 PPO 实现
+- [x] Metrics 指标（Loss、Entropy、KL、Value Loss）
+- [x] 中间状态展示
+- [x] 视频录制（1 case）
 - [ ] M1 验收：200+ steps
 - [ ] M2 验收：400+ steps
 - [ ] M3 验收：450+ steps
