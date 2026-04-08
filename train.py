@@ -1,6 +1,6 @@
 """
-CartPole PPO - 手写版
-统一训练脚本：手写 PPO + Metrics + 视频录制
+CartPole PPO - 手写版（完整版）
+包含: Value Clipping + KL Early Stopping + LR/Clip Decay
 """
 
 import gymnasium as gym
@@ -113,45 +113,53 @@ def compute_returns_and_advantages(val_buf, rew_buf, done_buf, gamma, lam):
 
 
 # ─────────────────────────────────────────────
-# PPO Loss
+# PPO Loss (with Value Clipping)
 # ─────────────────────────────────────────────
-def ppo_loss(model, obs_b, act_b, old_logp_b, returns_b, advantages_b,
+def ppo_loss(model, obs_b, act_b, old_logp_b, old_v_b, returns_b, advantages_b,
              logp_new_b, ent_b, clip_range, value_coef, ent_coef):
-    # Policy loss (PPO clipped objective)
+    # ── Policy loss (PPO clipped objective) ──
     ratio = torch.exp(logp_new_b - old_logp_b)
     surr1 = ratio * advantages_b
     ratio_clipped = torch.clamp(ratio, 1 - clip_range, 1 + clip_range)
     surr2 = ratio_clipped * advantages_b
     policy_loss = -torch.min(surr1, surr2).mean()
 
-    # Value loss
+    # ── Value loss (with value clipping) ──
     values_new = model.critic(model.net(obs_b)).squeeze(-1)
-    value_loss = nn.functional.mse_loss(values_new, returns_b)
+    # Clipped value: prevent critic from changing too fast
+    v_clipped = old_v_b + torch.clamp(values_new - old_v_b, -clip_range, clip_range)
+    # Take max of unclipped vs clipped (PPO symmetric with policy clip)
+    value_loss = torch.max(
+        (values_new - returns_b) ** 2,
+        (v_clipped - returns_b) ** 2
+    ).mean()
 
-    # Entropy loss (encourage exploration)
+    # ── Entropy loss ──
     entropy_loss = -ent_b.mean()
 
-    # KL divergence (for monitoring, not in loss)
-    kl = (logp_new_b - old_logp_b).mean()
-
     return (policy_loss + value_coef * value_loss + ent_coef * entropy_loss,
-            policy_loss, value_loss, entropy_loss, kl)
+            policy_loss, value_loss, entropy_loss)
 
 
 # ─────────────────────────────────────────────
-# Minibatch 更新
+# Minibatch 更新 (with KL Early Stopping)
 # ─────────────────────────────────────────────
-def ppo_update(model, optimizer, obs_b, act_b, old_logp_b, returns_b, advantages_b,
-               clip_range, value_coef, ent_coef, batch_size, n_epochs):
+def ppo_update(model, optimizer, obs_b, act_b, old_logp_b, old_v_b,
+               returns_b, advantages_b, clip_range, value_coef, ent_coef,
+               batch_size, n_epochs, target_kl=None):
     n = obs_b.shape[0]
 
-    for _ in range(n_epochs):
+    for epoch in range(n_epochs):
         idx = torch.randperm(n, device=DEVICE)
+        kl_sum = 0.0
+        num_batches = 0
+
         for start in range(0, n, batch_size):
             mb = idx[start:start + batch_size]
             logp_new, ent, _ = model.get_action_and_logprob(obs_b[mb], act_b[mb])
-            loss, p_loss, v_loss, ent_loss, kl = ppo_loss(
-                model, obs_b[mb], act_b[mb], old_logp_b[mb],
+
+            loss, p_loss, v_loss, ent_loss = ppo_loss(
+                model, obs_b[mb], act_b[mb], old_logp_b[mb], old_v_b[mb],
                 returns_b[mb], advantages_b[mb],
                 logp_new, ent, clip_range, value_coef, ent_coef)
 
@@ -160,7 +168,22 @@ def ppo_update(model, optimizer, obs_b, act_b, old_logp_b, returns_b, advantages
             torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
             optimizer.step()
 
-    return p_loss.item(), v_loss.item(), ent_loss.item(), kl.item()
+            kl_sum += (logp_new - old_logp_b[mb]).mean().item()
+            num_batches += 1
+
+        # KL early stopping
+        avg_kl = kl_sum / num_batches if num_batches > 0 else 0.0
+        if target_kl is not None and avg_kl > target_kl:
+            return p_loss.item(), v_loss.item(), ent_loss.item(), avg_kl, epoch + 1
+
+    return p_loss.item(), v_loss.item(), ent_loss.item(), avg_kl, n_epochs
+
+
+# ─────────────────────────────────────────────
+# 线性衰减
+# ─────────────────────────────────────────────
+def linear_decay(initial, final, progress):
+    return initial - (initial - final) * progress
 
 
 # ─────────────────────────────────────────────
@@ -170,7 +193,7 @@ def evaluate(env, model, n_episodes=20):
     model.eval()
     rewards, lengths, successes = [], [], []
 
-    for ep in range(n_episodes):
+    for _ in range(n_episodes):
         obs, _ = env.reset()
         obs_t = torch.tensor(obs, dtype=torch.float32, device=DEVICE)
         total_r = 0
@@ -187,7 +210,7 @@ def evaluate(env, model, n_episodes=20):
 
         rewards.append(total_r)
         lengths.append(steps)
-        successes.append(steps >= 500)  # CartPole-v1 max = 500
+        successes.append(steps >= 500)
 
     model.train()
     return np.mean(rewards), np.mean(lengths), np.mean(successes) * 100
@@ -197,7 +220,6 @@ def evaluate(env, model, n_episodes=20):
 # 视频录制
 # ─────────────────────────────────────────────
 def record_success_video(env, model, max_attempts=100):
-    """录制一个成功案例（500 steps）"""
     frames = []
     meta = None
 
@@ -275,7 +297,9 @@ def plot_metrics(metrics_log, save_dir):
 # ─────────────────────────────────────────────
 def train(env_id, total_steps=100_000, n_steps=2048, batch_size=64,
           n_epochs=10, lr=3e-4, gamma=0.99, lam=0.95,
-          clip_range=0.2, value_coef=0.5, ent_coef=0.01,
+          clip_range_init=0.2, clip_range_final=0.1,
+          value_coef=0.5, ent_coef=0.01,
+          target_kl=0.015,
           eval_every=10, log_every=5):
     env = gym.make(env_id)
     obs_dim = env.observation_space.shape[0]
@@ -285,19 +309,29 @@ def train(env_id, total_steps=100_000, n_steps=2048, batch_size=64,
     optimizer = optim.Adam(model.parameters(), lr=lr)
 
     print("=" * 60)
-    print("PPO - CartPole (手写版)")
+    print("PPO - CartPole (手写版 + 完整优化)")
     print(f"  env={env_id} | obs={obs_dim} | act={act_dim}")
     print(f"  n_steps={n_steps} | batch={batch_size} | epochs={n_epochs}")
-    print(f"  lr={lr} | gamma={gamma} | lam={lam} | clip={clip_range}")
+    print(f"  lr={lr} | gamma={gamma} | lam={lam}")
+    print(f"  clip: {clip_range_init} -> {clip_range_final}")
+    print(f"  value_clip + kl_early_stop + lr/clip_decay")
     print(f"  device={DEVICE}")
     print("=" * 60)
 
     total_updates = total_steps // n_steps
     metrics_log = {"update": [], "policy_loss": [], "value_loss": [],
-                   "entropy": [], "kl": [], "eval_reward": [],
-                   "eval_length": [], "eval_sr": []}
+                   "entropy": [], "kl": [], "lr": [], "clip": [],
+                   "eval_reward": [], "eval_length": [], "eval_sr": []}
 
     for it in range(1, total_updates + 1):
+        progress = (it - 1) / max(total_updates - 1, 1)
+
+        # ── Decay ──
+        current_lr = linear_decay(lr, lr * 0.1, progress)
+        current_clip = linear_decay(clip_range_init, clip_range_final, progress)
+        for pg in optimizer.param_groups:
+            pg["lr"] = current_lr
+
         # ── Rollout ──
         obs_b, act_b, rew_b, done_b, logp_b, val_b, ent_b = collect_rollout(env, model, n_steps)
 
@@ -318,17 +352,20 @@ def train(env_id, total_steps=100_000, n_steps=2048, batch_size=64,
         avg_train_r = np.mean(ep_rewards) if ep_rewards else 0.0
         avg_train_l = np.mean(ep_lengths) if ep_lengths else 0.0
 
-        # ── Update ──
-        p_loss, v_loss, entropy, kl = ppo_update(
-            model, optimizer, obs_b, act_b, logp_b, returns_b, advantages_b,
-            clip_range, value_coef, ent_coef, batch_size, n_epochs)
+        # ── Update (with value clipping + KL early stopping) ──
+        p_loss, v_loss, entropy, kl, n_epochs_used = ppo_update(
+            model, optimizer, obs_b, act_b, logp_b, val_b,
+            returns_b, advantages_b,
+            current_clip, value_coef, ent_coef,
+            batch_size, n_epochs, target_kl)
 
         # ── Log ──
         if it % log_every == 0:
             print(f"[U{it:3d}/{total_updates}] "
                   f"train_R={avg_train_r:7.2f} | train_L={avg_train_l:6.1f} | "
                   f"p_loss={p_loss:.4f} | v_loss={v_loss:.4f} | "
-                  f"ent={entropy:.4f} | kl={kl:.4f}")
+                  f"ent={entropy:.4f} | kl={kl:.4f} | "
+                  f"lr={current_lr:.6f} | clip={current_clip:.4f}")
 
         # ── Eval ──
         if it % eval_every == 0 or it == total_updates:
@@ -338,6 +375,8 @@ def train(env_id, total_steps=100_000, n_steps=2048, batch_size=64,
             metrics_log["value_loss"].append(v_loss)
             metrics_log["entropy"].append(entropy)
             metrics_log["kl"].append(kl)
+            metrics_log["lr"].append(current_lr)
+            metrics_log["clip"].append(current_clip)
             metrics_log["eval_reward"].append(eval_r)
             metrics_log["eval_length"].append(eval_l)
             metrics_log["eval_sr"].append(eval_sr)
@@ -364,7 +403,9 @@ if __name__ == "__main__":
         total_steps=args.steps,
         n_steps=2048, batch_size=64, n_epochs=10,
         lr=3e-4, gamma=0.99, lam=0.95,
-        clip_range=0.2, value_coef=0.5, ent_coef=0.01,
+        clip_range_init=0.2, clip_range_final=0.1,
+        value_coef=0.5, ent_coef=0.01,
+        target_kl=0.015,
         eval_every=10, log_every=5
     )
 
