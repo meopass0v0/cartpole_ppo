@@ -1,5 +1,5 @@
 """
-CartPole PPO - 手写版（完整版）
+CartPole PPO - 手写版 + AsyncVectorEnv (8 envs)
 包含: Value Clipping + KL Early Stopping + LR/Clip Decay
 """
 
@@ -13,136 +13,205 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 import os
 import imageio
+from gymnasium.vector import AsyncVectorEnv
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SAVE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 # ─────────────────────────────────────────────
+# Env Factory (给 AsyncVectorEnv 用)
+# ─────────────────────────────────────────────
+def make_env(env_id, seed, rank):
+    def _thunk():
+        env = gym.make(env_id)
+        env.reset(seed=seed + rank)
+        return env
+    return _thunk
+
+
+# ─────────────────────────────────────────────
 # Actor-Critic 网络
 # ─────────────────────────────────────────────
-class ActorCritic(nn.Module):
-    def __init__(self, obs_dim, act_dim, hidden=128):
+class ActorCriticSep(nn.Module):
+    def __init__(self, obs_dim, act_dim, hidden=128, critic_hidden=256):
         super().__init__()
-        self.net = nn.Sequential(
+        # Actor: smaller backbone, fast adaptation
+        self.actor_net = nn.Sequential(
             nn.Linear(obs_dim, hidden),
             nn.Tanh(),
             nn.Linear(hidden, hidden),
             nn.Tanh(),
         )
-        self.actor = nn.Linear(hidden, act_dim)
-        self.critic = nn.Linear(hidden, 1)
+        self.actor_head = nn.Linear(hidden, act_dim)
+
+        # Critic: larger backbone, stable value estimation
+        self.critic_net = nn.Sequential(
+            nn.Linear(obs_dim, critic_hidden),
+            nn.Tanh(),
+            nn.Linear(critic_hidden, critic_hidden),
+            nn.Tanh(),
+            nn.Linear(critic_hidden, critic_hidden // 2),
+            nn.Tanh(),
+        )
+        self.critic_head = nn.Linear(critic_hidden // 2, 1)
 
     def forward(self, x):
-        features = self.net(x)
-        return self.actor(features), self.critic(features)
+        actor_features = self.actor_net(x)
+        logits = self.actor_head(actor_features)
+        critic_features = self.critic_net(x)
+        value = self.critic_head(critic_features).squeeze(-1)
+        return logits, value
 
-    def get_action(self, obs):
-        action_logits, value = self.forward(obs)
-        dist = Categorical(logits=action_logits)
-        action = dist.sample()
-        return action, dist.log_prob(action), dist.entropy(), value.squeeze(-1)
+    def get_action(self, obs, deterministic=False):
+        logits, val = self.forward(obs)
+        dist = Categorical(logits=logits)
+        if deterministic:
+            action = torch.argmax(logits, dim=-1)
+        else:
+            action = dist.sample()
+        return action, dist.log_prob(action), dist.entropy(), val
 
     def get_action_and_logprob(self, obs, action):
-        action_logits, value = self.forward(obs)
-        dist = Categorical(logits=action_logits)
-        return dist.log_prob(action), dist.entropy(), value.squeeze(-1)
+        logits, val = self.forward(obs)
+        dist = Categorical(logits=logits)
+        return dist.log_prob(action), dist.entropy(), val
 
 
 # ─────────────────────────────────────────────
-# Rollout 收集
+# Rollout 收集 (AsyncVectorEnv) — 无 ent_buf
 # ─────────────────────────────────────────────
-def collect_rollout(env, model, n_steps):
-    obs_buf, act_buf, rew_buf = [], [], []
-    done_buf, logp_buf, val_buf = [], [], []
-    ent_buf = []
+def collect_rollout_vec(vec_env, model, obs_batch, n_steps_per_env):
+    """
+    收集 n_steps_per_env × n_envs 个 step。
+    Buffer shape: [T, N, ...]，T=n_steps_per_env, N=n_envs
 
-    obs, _ = env.reset()
-    obs = torch.tensor(obs, dtype=torch.float32, device=DEVICE)
+    obs_batch: 传入的初始 obs [N, obs_dim]（上一次 rollout 结束的状态）
+    返回: buffers + 最后一步的 obs_batch（供下一轮继续）
 
-    for _ in range(n_steps):
+    注意: 不存 ent_buf，entropy 在 update 时重新算
+    """
+    n_envs = vec_env.num_envs
+
+    T, N = n_steps_per_env, n_envs
+    obs_dim = obs_batch.shape[1]
+
+    obs_buf  = torch.zeros(T, N, obs_dim)           # CPU
+    act_buf  = torch.zeros(T, N, dtype=torch.long)    # CPU
+    rew_buf  = torch.zeros(T, N)                      # CPU
+    done_buf = torch.zeros(T, N, dtype=torch.bool)    # CPU
+    logp_buf = torch.zeros(T, N)                      # CPU
+    val_buf  = torch.zeros(T, N)                      # CPU
+
+    obs_current = obs_batch  # GPU tensor，外部传入
+
+    for t in range(T):
+        # GPU forward
         with torch.no_grad():
-            action, log_prob, entropy, value = model.get_action(obs)
+            action, log_prob, _, value = model.get_action(obs_current)
 
-        obs_np, reward, done, truncated, _ = env.step(action.item())
+        # Env step（CPU）
+        next_obs_np, reward_np, terminated_np, truncated_np, infos = vec_env.step(action.cpu().numpy())
+        done_np = np.logical_or(terminated_np, truncated_np)
 
-        if done or truncated:
-            obs_new, _ = env.reset()
-            obs_new = torch.tensor(obs_new, dtype=torch.float32, device=DEVICE)
-        else:
-            obs_new = torch.tensor(obs_np, dtype=torch.float32, device=DEVICE)
+        # 转 CPU tensor（单次 GPU→CPU copy）
+        obs_cpu = obs_current.cpu()
+        act_cpu = action.cpu()
+        val_cpu = value.to("cpu").clone()
+        logp_cpu = log_prob.cpu()
+        reward_t = torch.as_tensor(reward_np, dtype=torch.float32)
+        done_t   = torch.as_tensor(done_np, dtype=torch.bool)
 
-        obs_buf.append(obs)
-        act_buf.append(action)
-        rew_buf.append(reward)
-        done_buf.append(done or truncated)
-        logp_buf.append(log_prob)
-        val_buf.append(value)
-        ent_buf.append(entropy)
+        obs_buf[t]   = obs_cpu
+        act_buf[t]   = act_cpu
+        rew_buf[t]   = reward_t
+        done_buf[t]  = done_t
+        logp_buf[t]  = logp_cpu
+        val_buf[t]   = val_cpu
 
-        obs = obs_new
+        # 下一 step：numpy → CPU → GPU
+        obs_current = torch.as_tensor(next_obs_np, dtype=torch.float32, device=DEVICE)
 
-    return (torch.stack(obs_buf), torch.stack(act_buf),
-            torch.tensor(rew_buf, device=DEVICE),
-            torch.tensor(done_buf, device=DEVICE),
-            torch.stack(logp_buf), torch.stack(val_buf),
-            torch.stack(ent_buf))
+    # obs_current 此时是 GPU tensor，供下一轮 rollout 用
+    return obs_buf, act_buf, rew_buf, done_buf, logp_buf, val_buf, obs_current
 
 
 # ─────────────────────────────────────────────
-# GAE
+# GAE (Vectorized — 整块 [T, N] 一起算 + 全局 normalize)
 # ─────────────────────────────────────────────
-def compute_returns_and_advantages(val_buf, rew_buf, done_buf, gamma, lam):
-    n = len(rew_buf)
-    advantages = torch.zeros(n, device=DEVICE)
+def compute_returns_and_advantages_vec(val_buf, rew_buf, done_buf, last_values, gamma, lam):
+    """
+    val_buf:     [T, N]
+    rew_buf:     [T, N]
+    done_buf:    [T, N]
+    last_values: [N] — rollout 结束后最后一个状态的 value
+    return:      returns_flat, advantages_flat 均为 [T*N]
+    """
+    T, N = rew_buf.shape
+    advantages = torch.zeros(T, N)  # CPU
+    next_gae   = torch.zeros(N)  # CPU
 
-    next_value = val_buf[-1].item()
-    next_gae = 0.0
-
-    for t in reversed(range(n)):
+    for t in reversed(range(T)):
+        next_value = last_values if t == T - 1 else val_buf[t + 1]
         mask = 1.0 - done_buf[t].float()
         delta = rew_buf[t] + gamma * next_value * mask - val_buf[t]
         next_gae = delta + gamma * lam * mask * next_gae
         advantages[t] = next_gae
-        next_value = val_buf[t].item()
 
-    raw_advantages = advantages.clone()
-    advantages = (raw_advantages - raw_advantages.mean()) / (raw_advantages.std() + 1e-8)
-    returns = raw_advantages + val_buf
-    return returns, advantages
+    returns = advantages + val_buf
+
+    # 全局 normalize（不是 per-env）
+    adv_flat = advantages.reshape(T * N)
+    adv_flat = (adv_flat - adv_flat.mean()) / (adv_flat.std() + 1e-8)
+    ret_flat = returns.reshape(T * N)
+
+    # GAE 结果在 update 前搬到 GPU
+    return ret_flat.to(DEVICE), adv_flat.to(DEVICE)
 
 
 # ─────────────────────────────────────────────
-# PPO Loss (with Value Clipping)
+# Flatten buffer helper — 无 ent_buf
 # ─────────────────────────────────────────────
-def ppo_loss(model, obs_b, act_b, old_logp_b, old_v_b, returns_b, advantages_b,
-             logp_new_b, ent_b, clip_range, value_coef, ent_coef):
-    # ── Policy loss (PPO clipped objective) ──
+def flatten_buffer(obs_buf, act_buf, logp_buf, val_buf):
+    """[T, N, obs_dim] → [T*N, obs_dim]，正确 reshape"""
+    T, N = obs_buf.shape[:2]
+    obs_dim = obs_buf.shape[2]
+    return (
+        obs_buf.reshape(T * N, obs_dim),
+        act_buf.reshape(T * N),
+        logp_buf.reshape(T * N),
+        val_buf.reshape(T * N),
+    )
+
+
+# ─────────────────────────────────────────────
+# PPO Loss (with Value Clipping) — values_new_b 从外部传入
+# ─────────────────────────────────────────────
+def ppo_loss(old_logp_b, old_v_b, returns_b, advantages_b,
+             logp_new_b, values_new_b, ent_new_b, clip_range, value_coef, ent_coef):
+    # Policy loss (PPO clipped objective)
     ratio = torch.exp(logp_new_b - old_logp_b)
     surr1 = ratio * advantages_b
     ratio_clipped = torch.clamp(ratio, 1 - clip_range, 1 + clip_range)
     surr2 = ratio_clipped * advantages_b
     policy_loss = -torch.min(surr1, surr2).mean()
 
-    # ── Value loss (with value clipping) ──
-    values_new = model.critic(model.net(obs_b)).squeeze(-1)
-    # Clipped value: prevent critic from changing too fast
-    v_clipped = old_v_b + torch.clamp(values_new - old_v_b, -clip_range, clip_range)
-    # Take max of unclipped vs clipped (PPO symmetric with policy clip)
+    # Value loss (with value clipping) — values_new_b 直接从 get_action_and_logprob 传来
+    v_clipped = old_v_b + torch.clamp(values_new_b - old_v_b, -clip_range, clip_range)
     value_loss = torch.max(
-        (values_new - returns_b) ** 2,
+        (values_new_b - returns_b) ** 2,
         (v_clipped - returns_b) ** 2
     ).mean()
 
-    # ── Entropy loss ──
-    entropy_loss = -ent_b.mean()
+    # Entropy loss — 用新的 entropy
+    entropy_loss = -ent_new_b.mean()
 
     return (policy_loss + value_coef * value_loss + ent_coef * entropy_loss,
             policy_loss, value_loss, entropy_loss)
 
 
 # ─────────────────────────────────────────────
-# Minibatch 更新 (with KL Early Stopping)
+# Minibatch 更新 (with KL Early Stopping + 修正 KL)
 # ─────────────────────────────────────────────
 def ppo_update(model, optimizer, obs_b, act_b, old_logp_b, old_v_b,
                returns_b, advantages_b, clip_range, value_coef, ent_coef,
@@ -156,22 +225,26 @@ def ppo_update(model, optimizer, obs_b, act_b, old_logp_b, old_v_b,
 
         for start in range(0, n, batch_size):
             mb = idx[start:start + batch_size]
-            logp_new, ent, _ = model.get_action_and_logprob(obs_b[mb], act_b[mb])
+            logp_new, ent_new, values_new = model.get_action_and_logprob(obs_b[mb], act_b[mb])
 
             loss, p_loss, v_loss, ent_loss = ppo_loss(
-                model, obs_b[mb], act_b[mb], old_logp_b[mb], old_v_b[mb],
+                old_logp_b[mb], old_v_b[mb],
                 returns_b[mb], advantages_b[mb],
-                logp_new, ent, clip_range, value_coef, ent_coef)
+                logp_new, values_new, ent_new,
+                clip_range, value_coef, ent_coef)
 
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
             optimizer.step()
 
-            kl_sum += (logp_new - old_logp_b[mb]).mean().item()
+            # 稳定的 KL 估计: ((ratio-1) - log_ratio).mean()
+            log_ratio = logp_new - old_logp_b[mb]
+            ratio_kl = torch.exp(log_ratio)
+            approx_kl = ((ratio_kl - 1) - log_ratio).mean()
+            kl_sum += approx_kl.item()
             num_batches += 1
 
-        # KL early stopping
         avg_kl = kl_sum / num_batches if num_batches > 0 else 0.0
         if target_kl is not None and avg_kl > target_kl:
             return p_loss.item(), v_loss.item(), ent_loss.item(), avg_kl, epoch + 1
@@ -187,7 +260,7 @@ def linear_decay(initial, final, progress):
 
 
 # ─────────────────────────────────────────────
-# 评估
+# 评估（用单个 env）
 # ─────────────────────────────────────────────
 def evaluate(env, model, n_episodes=20):
     model.eval()
@@ -195,16 +268,16 @@ def evaluate(env, model, n_episodes=20):
 
     for _ in range(n_episodes):
         obs, _ = env.reset()
-        obs_t = torch.tensor(obs, dtype=torch.float32, device=DEVICE)
+        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=DEVICE)
         total_r = 0
         done = truncated = False
         steps = 0
 
         while not (done or truncated):
             with torch.no_grad():
-                action, _, _, _ = model.get_action(obs_t)
+                action, _, _, _ = model.get_action(obs_t, deterministic=True)
             obs, reward, done, truncated, _ = env.step(action.item())
-            obs_t = torch.tensor(obs, dtype=torch.float32, device=DEVICE)
+            obs_t = torch.as_tensor(obs, dtype=torch.float32, device=DEVICE)
             total_r += reward
             steps += 1
 
@@ -233,7 +306,7 @@ def record_success_video(env, model, max_attempts=100):
             frames.append(frame)
             with torch.no_grad():
                 action, _, _, _ = model.get_action(
-                    torch.tensor(obs, dtype=torch.float32, device=DEVICE))
+                    torch.as_tensor(obs, dtype=torch.float32, device=DEVICE), deterministic=True)
             obs, reward, done, truncated, _ = env.step(action.item())
             ep_reward += reward
 
@@ -266,7 +339,7 @@ def plot_metrics(metrics_log, save_dir):
 
     rows, cols = 3, 2
     fig, axes = plt.subplots(rows, cols, figsize=(12, 9))
-    fig.suptitle("PPO Training Metrics - CartPole", fontsize=14, fontweight="bold")
+    fig.suptitle("PPO Training Metrics - CartPole (AsyncVectorEnv x8)", fontsize=14, fontweight="bold")
 
     def subplot(ax, y, title, ylabel, color, hline=None):
         ax.plot(updates, y, color=color, linewidth=1.5)
@@ -295,66 +368,119 @@ def plot_metrics(metrics_log, save_dir):
 # ─────────────────────────────────────────────
 # 训练
 # ─────────────────────────────────────────────
-def train(env_id, total_steps=100_000, n_steps=2048, batch_size=64,
-          n_epochs=10, lr=3e-4, gamma=0.99, lam=0.95,
-          clip_range_init=0.2, clip_range_final=0.1,
+def train(env_id, total_steps=100_000, n_steps_per_env=512, n_envs=8,
+          batch_size=512, n_epochs=3,
+          lr=1e-4, gamma=0.99, lam=0.85,
+          clip_range_init=0.15, clip_range_final=0.08,
           value_coef=0.5, ent_coef=0.01,
           target_kl=0.015,
-          eval_every=10, log_every=5):
-    env = gym.make(env_id)
-    obs_dim = env.observation_space.shape[0]
-    act_dim = env.action_space.n
+          eval_every=10, log_every=5,
+          load_path=None):
+    """
+    n_steps_per_env: 每个 env 收集的步数 (T=512)
+    n_envs: 并行 env 数量 (N=8)
+    总步数 per rollout = n_steps_per_env * n_envs = 4096
+    """
+    # ── AsyncVectorEnv（真并行）──
+    env_fns = [make_env(env_id, 42, i) for i in range(n_envs)]
+    vec_env = AsyncVectorEnv(env_fns)
 
-    model = ActorCritic(obs_dim, act_dim, hidden=128).to(DEVICE)
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+    n_total_steps = n_steps_per_env * n_envs
+
+    obs_dim = vec_env.single_observation_space.shape[0]
+    act_dim = vec_env.single_action_space.n
+
+    model = ActorCriticSep(obs_dim, act_dim, hidden=256, critic_hidden=512).to(DEVICE)
+
+    # Load checkpoint if provided
+    if load_path:
+        ckpt = torch.load(load_path, map_location=DEVICE)
+        model.load_state_dict(ckpt)
+        print("[INFO] Loaded checkpoint from " + load_path)
+    # 分离 optimizer: actor 保守，critic 积极
+    actor_lr = 1e-4
+    critic_lr = 2e-4
+    optimizer = optim.Adam([
+        {"params": model.actor_net.parameters(), "lr": actor_lr},
+        {"params": model.actor_head.parameters(), "lr": actor_lr},
+        {"params": model.critic_net.parameters(), "lr": critic_lr},
+        {"params": model.critic_head.parameters(), "lr": critic_lr},
+    ])
 
     print("=" * 60)
-    print("PPO - CartPole (手写版 + 完整优化)")
+    print("PPO - CartPole (手写版 + AsyncVectorEnv x8)")
     print(f"  env={env_id} | obs={obs_dim} | act={act_dim}")
-    print(f"  n_steps={n_steps} | batch={batch_size} | epochs={n_epochs}")
+    print(f"  n_envs={n_envs} | n_steps_per_env={n_steps_per_env} | total={n_total_steps}")
+    print(f"  batch={batch_size} | epochs={n_epochs}")
     print(f"  lr={lr} | gamma={gamma} | lam={lam}")
     print(f"  clip: {clip_range_init} -> {clip_range_final}")
     print(f"  value_clip + kl_early_stop + lr/clip_decay")
     print(f"  device={DEVICE}")
     print("=" * 60)
 
-    total_updates = total_steps // n_steps
+    total_updates = total_steps // n_total_steps
     metrics_log = {"update": [], "policy_loss": [], "value_loss": [],
                    "entropy": [], "kl": [], "lr": [], "clip": [],
                    "eval_reward": [], "eval_length": [], "eval_sr": []}
+
+    # ── 只在开头 reset 一次 ──
+    obs_np, _ = vec_env.reset(seed=42)
+    obs_batch = torch.as_tensor(obs_np, dtype=torch.float32, device=DEVICE)  # GPU
+
+    # ── 跨 rollout 的 episode 状态 ──
+    running_ep_r = np.zeros(n_envs, dtype=np.float32)
+    running_ep_l = np.zeros(n_envs, dtype=np.int32)
 
     for it in range(1, total_updates + 1):
         progress = (it - 1) / max(total_updates - 1, 1)
 
         # ── Decay ──
-        current_lr = linear_decay(lr, lr * 0.1, progress)
+        current_lr   = linear_decay(lr, lr * 0.1, progress)
         current_clip = linear_decay(clip_range_init, clip_range_final, progress)
         for pg in optimizer.param_groups:
             pg["lr"] = current_lr
 
         # ── Rollout ──
-        obs_b, act_b, rew_b, done_b, logp_b, val_b, ent_b = collect_rollout(env, model, n_steps)
+        obs_b, act_b, rew_b, done_b, logp_b, val_b, obs_batch = \
+            collect_rollout_vec(vec_env, model, obs_batch, n_steps_per_env)
 
-        # ── GAE ──
-        returns_b, advantages_b = compute_returns_and_advantages(val_b, rew_b, done_b, gamma, lam)
+        # ── 计算 last_values ──
+        with torch.no_grad():
+            _, last_values = model.forward(obs_batch)
+            last_values = last_values.squeeze(-1).to("cpu").clone()  # GAE 在 CPU 算
 
-        # ── Train Metrics ──
-        ep_rewards, ep_lengths = [], []
-        ep_r, ep_l = 0.0, 0
-        for i in range(n_steps):
-            ep_r += rew_b[i].item()
-            ep_l += 1
-            if done_b[i]:
-                ep_rewards.append(ep_r)
-                ep_lengths.append(ep_l)
-                ep_r, ep_l = 0.0, 0
+        # ── GAE（整块 [T,N] + 全局 normalize）──
+        returns_b, advantages_b = compute_returns_and_advantages_vec(
+            val_b, rew_b, done_b, last_values, gamma, lam)
 
-        avg_train_r = np.mean(ep_rewards) if ep_rewards else 0.0
-        avg_train_l = np.mean(ep_lengths) if ep_lengths else 0.0
+        # ── Flatten buffers → 一次性搬到 GPU ──
+        obs_flat, act_flat, logp_flat, val_flat = flatten_buffer(obs_b, act_b, logp_b, val_b)
+        obs_flat = obs_flat.to(DEVICE)
+        act_flat = act_flat.to(DEVICE)
+        logp_flat = logp_flat.to(DEVICE)
+        val_flat = val_flat.to(DEVICE)
 
-        # ── Update (with value clipping + KL early stopping) ──
-        p_loss, v_loss, entropy, kl, n_epochs_used = ppo_update(
-            model, optimizer, obs_b, act_b, logp_b, val_b,
+        # ── Train Metrics（per-env 追踪，running 跨 rollout）──
+        finished_rewards, finished_lengths = [], []
+
+        for t in range(n_steps_per_env):
+            rew_t = rew_b[t].cpu().numpy()
+            done_t = done_b[t].cpu().numpy()
+            running_ep_r += rew_t
+            running_ep_l += 1
+            for e in range(n_envs):
+                if done_t[e]:
+                    finished_rewards.append(running_ep_r[e])
+                    finished_lengths.append(running_ep_l[e])
+                    running_ep_r[e] = 0.0
+                    running_ep_l[e] = 0
+
+        avg_train_r = np.mean(finished_rewards) if finished_rewards else 0.0
+        avg_train_l = np.mean(finished_lengths) if finished_lengths else 0.0
+
+        # ── Update ──
+        p_loss, v_loss, entropy, kl, _ = ppo_update(
+            model, optimizer, obs_flat, act_flat, logp_flat, val_flat,
             returns_b, advantages_b,
             current_clip, value_coef, ent_coef,
             batch_size, n_epochs, target_kl)
@@ -369,7 +495,9 @@ def train(env_id, total_steps=100_000, n_steps=2048, batch_size=64,
 
         # ── Eval ──
         if it % eval_every == 0 or it == total_updates:
-            eval_r, eval_l, eval_sr = evaluate(env, model, n_episodes=20)
+            eval_env = gym.make(env_id)
+            eval_r, eval_l, eval_sr = evaluate(eval_env, model, n_episodes=20)
+            eval_env.close()
             metrics_log["update"].append(it)
             metrics_log["policy_loss"].append(p_loss)
             metrics_log["value_loss"].append(v_loss)
@@ -382,6 +510,7 @@ def train(env_id, total_steps=100_000, n_steps=2048, batch_size=64,
             metrics_log["eval_sr"].append(eval_sr)
             print(f"  >> [Eval] R={eval_r:7.2f} | L={eval_l:5.1f} | SR={eval_sr:5.1f}%")
 
+    vec_env.close()
     return model, metrics_log
 
 
@@ -391,20 +520,37 @@ def train(env_id, total_steps=100_000, n_steps=2048, batch_size=64,
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--steps", type=int, default=100_000)
+    parser.add_argument("--steps", type=int, default=10000000)
+    parser.add_argument("--load_latest", action="store_true")
     args = parser.parse_args()
 
     print("=" * 60)
-    print("CartPole PPO Training")
+    print("CartPole PPO Training (AsyncVectorEnv x8)")
     print("=" * 60)
+
+    # Load latest checkpoint if requested
+    if args.load_latest:
+        import glob as glob_module
+        pt_files = sorted(glob_module.glob(os.path.join(SAVE_DIR, 'ppo_cartpole_*.pt')))
+        if pt_files:
+            latest = pt_files[-1]
+            print(f'[INFO] Loading latest checkpoint: {latest}')
+            load_path = latest
+        else:
+            print('[WARN] No checkpoint found, starting from scratch')
+            load_path = None
+    else:
+        load_path = None
 
     model, metrics_log = train(
         env_id="CartPole-v1",
         total_steps=args.steps,
-        n_steps=2048, batch_size=64, n_epochs=10,
-        lr=3e-4, gamma=0.99, lam=0.95,
-        clip_range_init=0.2, clip_range_final=0.1,
-        value_coef=0.5, ent_coef=0.01,
+        load_path=load_path if "load_path" in dir() else None,
+        n_steps_per_env=512, n_envs=16,
+        batch_size=512, n_epochs=2,
+        lr=2e-4, gamma=0.99, lam=0.9,
+        clip_range_init=0.2, clip_range_final=0.08,
+        value_coef=0.5, ent_coef=0.02,
         target_kl=0.015,
         eval_every=10, log_every=5
     )
